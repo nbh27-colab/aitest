@@ -1,0 +1,40 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environment
+venv/
+env/
+ENV/
+.venv/
+.pipenv/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# macOS system files
+.DS_Store
+
+# Editor directories and files
+.vscode/
+.idea/
+*.swp
+
+# Database and data folders
+pgdata/
+data/tmp_uploads/
+
+# Python cache
+*.pyo
+
+# Docker
+*.log
+
+# Config
+*.env
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
