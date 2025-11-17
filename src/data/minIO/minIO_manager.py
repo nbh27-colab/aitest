@@ -2,6 +2,10 @@ import boto3
 from typing import Union, Tuple
 from pathlib import Path
 from botocore.exceptions import ClientError
+from contextlib import contextmanager
+from collections.abc import Generator
+from pathlib import Path
+import tempfile
 
 from src.core.process_file_name import FileNameProcessor
 
@@ -59,4 +63,18 @@ class PrivateS3:
         public_url = self.get_file_public_url(bucket_name, remote_file_path)
         return public_url, remote_file_path
     
-    
+    @contextmanager
+    def download_file(
+        self,
+        bucket_name: str,
+        remote_file_path: str,
+    ) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_file_path = Path(temp_dir) / Path(remote_file_path).name
+
+            self.s3_resource.Bucket(bucket_name).download_file(
+                Key=remote_file_path,
+                Filename=str(local_file_path)
+            )
+
+            yield local_file_path

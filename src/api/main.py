@@ -1,8 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from src.api.routers import (
-    upload,
-)
+from src.api.routers import *
 
 # instance
 app = FastAPI(
@@ -19,7 +17,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(crud.router, prefix="/api")
 app.include_router(upload.router, prefix="/api")
+app.include_router(autotest.router, prefix="/api")
 
 @app.get("/")
 async def root():

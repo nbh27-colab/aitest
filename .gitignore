@@ -38,3 +38,6 @@ data/tmp_uploads/
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
+
+*.png
+*.jpg

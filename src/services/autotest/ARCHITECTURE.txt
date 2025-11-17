@@ -1,0 +1,643 @@
+"""
+AutoTest Workflow Architecture
+================================
+
+┌─────────────────────────────────────────────────────────────────┐
+│                         API LAYER                                │
+│  POST /api/autotest/run                                         │
+│  { test_case_id, login_info_id }                                │
+└─────────────────────┬───────────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    LANGGRAPH WORKFLOW                            │
+│                                                                  │
+│  ┌────────────┐                                                 │
+│  │ INITIALIZE │  Khởi tạo workflow:                             │
+│  │            │  - Load test case từ DB                         │
+│  │            │  - Load steps (thứ tự từ step_order)            │
+│  │            │  - Load login info                              │
+│  │            │  - Khởi động Playwright browser (headless=False)│
+│  │            │  - Initialize state variables                   │
+│  └─────┬──────┘                                                 │
+│        │                                                         │
+│        ▼                                                         │
+│  ┌────────────┐                                                 │
+│  │ AUTO_LOGIN │  Tự động đăng nhập:                             │
+│  │            │  - Navigate đến web_url                         │
+│  │            │  - Tìm form đăng nhập (multiple selectors)      │
+│  │            │  - Fill email/username                          │
+│  │            │  - Fill password                                │
+│  │            │  - Click submit button                          │
+│  │            │  - Chụp screenshot sau login                    │
+│  │            │  - Nếu Step 1 là login → skip step đó           │
+│  └─────┬──────┘                                                 │
+│        │                                                         │
+│        ▼                                                         │
+│  ┌────────────────┐                                             │
+│  │ GET_CONTEXT    │  Trích xuất trạng thái page:                │
+│  │                │  - current_url                              │
+│  │                │  - page_title, main_heading                 │
+│  │                │  - visible_elements (buttons, inputs, links)│
+│  │                │  - dom_snapshot (HTML structure)            │
+│  │                │  - screenshot_base64                        │
+│  │                │  - console_logs                             │
+│  │                │  - previous_results (lịch sử substeps)      │
+│  └────────┬───────┘                                             │
+│           │                                                      │
+│           ▼                                                      │
+│  ┌──────────────────┐                                           │
+│  │ GENERATE_SUBSTEP │  Generate kế hoạch substep với LLM:       │
+│  │                  │  - Input: step goal + page context        │
+│  │                  │  - LLM analyze và quyết định action        │
+│  │                  │  - Output: SubStepPlan                    │
+│  │                  │    + substep_description                  │
+│  │                  │    + action_type (click/fill/verify...)   │
+│  │                  │    + target_element (selectors)           │
+│  │                  │    + verification (điều kiện kiểm tra)    │
+│  │                  │    + is_final_substep (boolean)           │
+│  │                  │  - Duplicate detection (tránh lặp vô hạn) │
+│  │                  │  - Destructive action prevention          │
+│  │                  │  - Tạo sub_step record trong DB           │
+│  │                  │  - Generate Playwright script             │
+│  │                  │  - Lưu script vào generated_script table  │
+│  └────────┬─────────┘                                           │
+│           │                                                      │
+│           ▼                                                      │
+│  ┌──────────────────┐                                           │
+│  │ EXECUTE_SUBSTEP  │  Thực thi Playwright script:              │
+│  │                  │  - exec() script đã generate              │
+│  │                  │  - await execute_substep_X(page)          │
+│  │                  │  - Chụp screenshot                        │
+│  │                  │  - Post-verification (kiểm tra lại)       │
+│  │                  │  - Update consecutive_failures counter    │
+│  │                  │  - Lưu screenshot vào MinIO (TODO)        │
+│  │                  │  - Tạo test_result record                 │
+│  │                  │  - Return ExecutionResult                 │
+│  └────────┬─────────┘                                           │
+│           │                                                      │
+│           ▼                                                      │
+│  ┌──────────────────┐                                           │
+│  │ VALIDATE_STEP    │  Validation bằng LLM:                     │
+│  │                  │  - Extract cleaned HTML (remove scripts)  │
+│  │                  │  - So sánh với expected_result của step   │
+│  │                  │  - LLM phân tích DOM/URL                  │
+│  │                  │  - Return ValidationResult:               │
+│  │                  │    + is_completed (boolean)               │
+│  │                  │    + confidence (0.0-1.0)                 │
+│  │                  │    + reason (giải thích)                  │
+│  │                  │    + evidence (bằng chứng từ HTML)        │
+│  │                  │  - Track page_state_history               │
+│  │                  │  - Stuck detection (3 lần không đổi)      │
+│  │                  │  - Override execution result nếu cần      │
+│  └────────┬─────────┘                                           │
+│           │                                                      │
+│           ▼                                                      │
+│  ┌──────────────────┐                                           │
+│  │ DECISION_NEXT    │  Conditional edge - Quyết định tiếp theo: │
+│  │  (conditional)   │  1. Check overall_status (completed/error)│
+│  │                  │  2. Check max substeps (10/step)          │
+│  │                  │  3. Check consecutive_failures (>= 5)     │
+│  │                  │  4. Sử dụng last_validation result:       │
+│  │                  │     - confidence >= 0.7 → tin cậy         │
+│  │                  │     - is_completed=True → next_step       │
+│  │                  │     - is_completed=False → continue       │
+│  │                  │  5. Check stuck state (3 no-change)       │
+│  │                  │  6. Fallback: execution result            │
+│  │                  │  Output: "continue_substeps" |            │
+│  │                  │          "next_step" | "finish"           │
+│  └────────┬─────────┘                                           │
+│           │                                                      │
+│           ├─ continue_substeps ──┐                              │
+│           │                       │                              │
+│           │                       ▼                              │
+│           │              ┌──────────────────┐                   │
+│           │              │ CONTINUE_SUBSTEPS│                   │
+│           │              │ Increment index  │                   │
+│           │              └────────┬─────────┘                   │
+│           │                       │                              │
+│           │                       └──────► GET_CONTEXT          │
+│           │                                      ▲               │
+│           │                                      │               │
+│           ├─ next_step ───────┐                 │               │
+│           │                    │                 │               │
+│           │                    ▼                 │               │
+│           │           ┌──────────────────┐      │               │
+│           │           │ MOVE_TO_NEXT_STEP│      │               │
+│           │           │ - Mark completed │      │               │
+│           │           │ - Increment step │      │               │
+│           │           │ - Reset substep  │      │               │
+│           │           └────────┬─────────┘      │               │
+│           │                    │                 │               │
+│           │                    └─────────────────┘               │
+│           │                                                      │
+│           └─ finish                                              │
+│                │                                                 │
+│                ▼                                                 │
+│         ┌────────────┐                                          │
+│         │  CLEANUP   │  Dọn dẹp và kết thúc:                    │
+│         │            │  - Close page                            │
+│         │            │  - Close browser                         │
+│         │            │  - Stop playwright                       │
+│         │            │  - Tính overall_status (passed/failed)   │
+│         │            │  - Log summary statistics                │
+│         └────────────┘                                          │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       DATABASE MODELS                            │
+└─────────────────────────────────────────────────────────────────┘
+
+TABLE: test_case
+  - test_case_id (PK)
+  - title, description
+  - project_id (FK)
+
+TABLE: step
+  - step_id (PK)
+  - test_case_id (FK)
+  - step_order (thứ tự)
+  - action (mô tả bước cần làm)
+  - expected_result (kết quả mong đợi)
+
+TABLE: sub_step (AUTO-GENERATED)
+  - sub_step_id (PK)
+  - step_id (FK)
+  - sub_step_order
+  - sub_step_content (mô tả chi tiết)
+  - expected_result
+
+TABLE: generated_script (AUTO-GENERATED)
+  - generated_script_id (PK)
+  - sub_step_id (FK)
+  - script_content (Playwright code)
+
+TABLE: test_result (AUTO-GENERATED)
+  - test_result_id (PK)
+  - object_id (sub_step_id hoặc step_id)
+  - object_type ('sub_step' hoặc 'step')
+  - result (True/False)
+  - reason (lý do pass/fail)
+
+TABLE: screenshot (AUTO-GENERATED)
+  - screenshot_id (PK)
+  - generated_script_id (FK)
+  - screenshot_link (URL trong MinIO)
+
+TABLE: login_info
+  - login_info_id (PK)
+  - web_url
+  - email, password
+
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    NODES TRONG WORKFLOW                          │
+└─────────────────────────────────────────────────────────────────┘
+
+1. INITIALIZE
+   Loại: Setup node
+   Input: test_case_id, login_info_id
+   Xử lý:
+   - Query DB để load test_case, steps, login_info
+   - Khởi động Playwright (chromium.launch)
+   - Tạo browser context và page
+   - Initialize state variables
+   Output: Updated state với test data và browser
+
+2. AUTO_LOGIN
+   Loại: Action node
+   Input: page, login_info
+   Xử lý:
+   - Navigate đến web_url
+   - Tìm form login bằng multiple selectors
+   - Fill email/username, password
+   - Click submit button
+   - Wait for navigation
+   - Screenshot sau login
+   - Nếu Step 1 là login → mark completed và skip
+   Output: login_completed=True
+
+3. GET_CONTEXT
+   Loại: Extract node
+   Input: page
+   Xử lý:
+   - Extract current_url, page_title
+   - Find visible interactive elements (buttons, inputs, links)
+   - Get DOM snapshot
+   - Capture screenshot (base64)
+   - Get console logs
+   - Include previous execution results
+   Output: PageContext object
+
+4. GENERATE_SUBSTEP
+   Loại: LLM node
+   Input: current step, page_context, substep_index
+   Xử lý:
+   - Call LLM (GPT-4) để analyze và plan
+   - LLM trả về SubStepPlan:
+     + substep_description
+     + action_type (click/fill/select/verify/wait/navigate)
+     + target_element (selectors)
+     + verification (điều kiện check)
+     + is_final_substep (boolean)
+   - Duplicate detection (tránh lặp)
+   - Destructive action prevention (logout không mong muốn)
+   - Create sub_step record trong DB
+   - Generate Playwright script từ plan
+   - Save script vào generated_script table
+   Output: Updated substep_plans, current_substep_id
+
+5. EXECUTE_SUBSTEP
+   Loại: Execution node
+   Input: current_substep_id
+   Xử lý:
+   - Load generated_script từ DB
+   - exec() script trong Python runtime
+   - Call async function execute_substep_X(page)
+   - Capture screenshot
+   - Post-verification (check lại kết quả)
+   - Update consecutive_failures counter
+   - Create test_result record
+   - Create screenshot record
+   Output: ExecutionResult (success/fail, message, screenshot)
+
+6. VALIDATE_STEP
+   Loại: LLM validation node
+   Input: current step, page HTML, URL
+   Xử lý:
+   - Extract và clean HTML (remove scripts/styles)
+   - Call LLM để so sánh với expected_result
+   - LLM analyze DOM/URL để xác định completion
+   - Return ValidationResult:
+     + is_completed (boolean)
+     + confidence (0.0-1.0)
+     + reason (giải thích)
+     + evidence (trích dẫn từ HTML)
+   - Track page_state_history
+   - Stuck detection (3 lần HTML/URL không đổi)
+   - Override execution result nếu confidence cao
+   Output: last_validation object
+
+7. DECISION_NEXT (Conditional Edge)
+   Loại: Router/Decision node
+   Input: state (all data)
+   Logic:
+   1. Check overall_status (completed/error) → finish
+   2. Check current_step_index >= len(steps) → finish
+   3. Check max_substeps (10) → next_step
+   4. Check consecutive_failures >= 5 → finish
+   5. Use last_validation nếu confidence >= 0.7:
+      - is_completed=True → next_step
+      - is_completed=False → continue_substeps
+   6. Check consecutive_no_change >= 3 → next_step
+   7. Fallback: Use execution result
+   Output: "continue_substeps" | "next_step" | "finish"
+
+8. CONTINUE_SUBSTEPS
+   Loại: Helper node
+   Input: state
+   Xử lý:
+   - Increment current_substep_index += 1
+   - Không reset gì khác
+   Output: Updated state → loop về GET_CONTEXT
+
+9. MOVE_TO_NEXT_STEP
+   Loại: Helper node
+   Input: state
+   Xử lý:
+   - Mark current_step_index vào completed_steps
+   - Increment current_step_index += 1
+   - Reset current_substep_index = 0
+   - Reset substep_plans = []
+   - Reset consecutive_failures = 0
+   - Reset current_substep_id = None
+   - Skip any already completed steps
+   Output: Updated state → loop về GET_CONTEXT
+
+10. CLEANUP
+    Loại: Teardown node
+    Input: state
+    Xử lý:
+    - Close page
+    - Close browser
+    - Stop playwright
+    - Calculate overall_status:
+      + All steps completed → 'passed'
+      + Some failed → 'failed'
+      + Error occurred → 'error'
+    - Log summary statistics
+    Output: Final state with end_time
+
+
+┌─────────────────────────────────────────────────────────────────┐
+│                      KEY CONCEPTS                                │
+└─────────────────────────────────────────────────────────────────┘
+
+1. SEQUENTIAL GENERATION
+   - SubSteps được generate TỪNG CÁI MỘT
+   - Mỗi substep nhìn thấy trạng thái THỰC TẾ của page sau action trước
+   - KHÔNG pre-plan toàn bộ substeps trước
+
+2. CONTEXT AWARENESS
+   - Trước mỗi substep, extract fresh page context
+   - Include: URL, DOM elements, screenshot, previous results
+   - LLM quyết định action tiếp theo dựa trên reality hiện tại
+
+3. ADAPTIVE EXECUTION
+   - Handle dynamic UI (modals, redirects, dropdowns)
+   - Retry với backup selectors
+   - Adjust theo những gì thực sự xảy ra
+
+4. VALIDATION-BASED COMPLETION
+   - Không chỉ dựa vào execution success/fail
+   - Sử dụng LLM validation để check DOM/URL
+   - Có thể override execution result nếu LLM confident
+   - Prevent stuck states (duplicate plans, no page changes)
+
+5. LOOP PREVENTION
+   - Max 10 substeps per step
+   - Duplicate plan detection (window=3)
+   - Stuck detection (3 lần page không đổi)
+   - Consecutive failures limit (5)
+   - Destructive action prevention
+
+6. DATA FLOW
+6. DATA FLOW
+   
+   Manual Input (từ user):
+   ┌──────────────────┐
+   │  Test Case       │  title: "Test shopping cart"
+   │  test_case_id: 1 │
+   └────────┬─────────┘
+            │
+            ▼
+   ┌──────────────────┐
+   │  Step 1          │  action: "Add product to cart"
+   │  step_order: 1   │  expected: "Cart shows 1 item"
+   └────────┬─────────┘
+   ┌──────────────────┐
+   │  Step 2          │  action: "Proceed to checkout"
+   │  step_order: 2   │  expected: "On checkout page"
+   └──────────────────┘
+   
+   Auto-Generated Output:
+   ┌──────────────────────────────────────────────────┐
+   │ SubStep 1.1 (sub_step_id: 101)                   │
+   │   content: "Click on product image"              │
+   │   expected: "Product detail page loads"          │
+   ├──────────────────────────────────────────────────┤
+   │ Generated Script 1.1 (script_id: 201)            │
+   │   async def execute_substep_101(page):           │
+   │     await page.click('.product-img')             │
+   │     ...                                          │
+   ├──────────────────────────────────────────────────┤
+   │ Execution Result 1.1                             │
+   │   success: True                                  │
+   │   message: "Clicked successfully"                │
+   │   screenshot: "substep_101.png"                  │
+   ├──────────────────────────────────────────────────┤
+   │ Test Result 1.1 (result_id: 301)                 │
+   │   object_type: 'sub_step'                        │
+   │   object_id: 101                                 │
+   │   result: True                                   │
+   └──────────────────────────────────────────────────┘
+   
+   ... (more substeps)
+   
+   ┌──────────────────────────────────────────────────┐
+   │ SubStep 1.4 (sub_step_id: 104)                   │
+   │   content: "Verify cart count is 1"              │
+   │   expected: "Cart badge shows '1'"               │
+   │   is_final_substep: True                         │
+   ├──────────────────────────────────────────────────┤
+   │ Validation Result                                │
+   │   is_completed: True                             │
+   │   confidence: 0.95                               │
+   │   reason: "Cart badge text is '1'"               │
+   │   evidence: "<span class='badge'>1</span>"       │
+   └──────────────────────────────────────────────────┘
+   
+   → Step 1 COMPLETED → Move to Step 2
+
+
+┌─────────────────────────────────────────────────────────────────┐
+│                   EXECUTION EXAMPLE                              │
+└─────────────────────────────────────────────────────────────────┘
+
+Step Goal: "Search for iPhone 15"
+Expected Result: "Search results show iPhone 15 products"
+
+Iteration 1:
+  GET_CONTEXT → 
+    - Page has search icon in header
+    - No search input visible yet
+  
+  GENERATE_SUBSTEP →
+    - action_type: 'click'
+    - target: search icon button
+    - description: "Click search icon to open search box"
+    - is_final_substep: False
+  
+  EXECUTE_SUBSTEP →
+    - Clicked search icon
+    - Search box appeared and focused
+    - success: True
+  
+  VALIDATE_STEP →
+    - is_completed: False (chưa search gì)
+    - confidence: 0.8
+    - reason: "Search box visible but no query entered"
+  
+  DECISION → continue_substeps
+
+Iteration 2:
+  GET_CONTEXT →
+    - Search input now visible and focused
+    - Previous: clicked search icon successfully
+  
+  GENERATE_SUBSTEP →
+    - action_type: 'fill'
+    - target: search input field
+    - value: 'iPhone 15'
+    - description: "Type 'iPhone 15' into search box"
+    - is_final_substep: False
+  
+  EXECUTE_SUBSTEP →
+    - Typed 'iPhone 15'
+    - Autocomplete dropdown appeared with suggestions
+    - success: True
+  
+  VALIDATE_STEP →
+    - is_completed: False (chưa search)
+    - confidence: 0.85
+    - reason: "Query entered but not submitted"
+  
+  DECISION → continue_substeps
+
+Iteration 3:
+  GET_CONTEXT →
+    - Autocomplete dropdown visible with 5 suggestions
+    - First suggestion: "iPhone 15 Pro Max"
+  
+  GENERATE_SUBSTEP →
+    - action_type: 'click'
+    - target: first autocomplete suggestion
+    - description: "Click first suggestion"
+    - is_final_substep: False
+  
+  EXECUTE_SUBSTEP →
+    - Clicked first suggestion
+    - Navigated to search results page
+    - URL changed to /search?q=iPhone+15
+    - success: True
+  
+  VALIDATE_STEP →
+    - is_completed: False (cần verify kết quả)
+    - confidence: 0.75
+    - reason: "On search results page but not verified yet"
+  
+  DECISION → continue_substeps
+
+Iteration 4:
+  GET_CONTEXT →
+    - On search results page
+    - URL contains 'search?q=iPhone+15'
+    - Multiple product cards visible
+    - Heading: "Search results for iPhone 15"
+  
+  GENERATE_SUBSTEP →
+    - action_type: 'verify'
+    - verification: check product cards contain 'iPhone 15'
+    - description: "Verify search results show iPhone 15 products"
+    - is_final_substep: True
+  
+  EXECUTE_SUBSTEP →
+    - Found 12 product cards
+    - All contain 'iPhone 15' in title
+    - success: True
+  
+  VALIDATE_STEP →
+    - is_completed: True ✓
+    - confidence: 0.95
+    - reason: "Search results page shows iPhone 15 products as expected"
+    - evidence: "<h1>Search results for iPhone 15</h1>..."
+  
+  DECISION → next_step
+
+→ Move to next Step
+
+
+┌─────────────────────────────────────────────────────────────────┐
+│                   STATE MANAGEMENT                               │
+└─────────────────────────────────────────────────────────────────┘
+
+AutoTestState {
+  // Input
+  test_case_id: int
+  login_info_id: int
+  
+  // Loaded data
+  test_case: {...}
+  login_info: {...}
+  steps: [{step_id, step_order, action, expected_result}, ...]
+  
+  // Execution tracking
+  current_step_index: 0..len(steps)-1
+  current_substep_index: 0..N
+  completed_steps: [0, 1, 3, ...]  // indices of completed steps
+  login_completed: bool
+  
+  // Browser
+  browser: PlaywrightBrowser
+  page: PlaywrightPage
+  
+  // Context
+  page_context: {
+    current_url, page_title, visible_elements,
+    dom_snapshot, screenshot_base64, ...
+  }
+  page_state_history: [{url, html_hash, timestamp}, ...]
+  
+  // Plans & Results
+  substep_plans: [SubStepPlan, ...]
+  execution_results: [ExecutionResult, ...]
+  generated_scripts: [script_id_1, script_id_2, ...]
+  current_substep_id: int | None
+  
+  // Validation
+  last_validation: {is_completed, confidence, reason, evidence}
+  
+  // Loop prevention
+  consecutive_failures: 0..5
+  consecutive_no_change: 0..3
+  
+  // Overall
+  overall_status: 'running' | 'completed' | 'passed' | 'failed' | 'error'
+  error_message: str | None
+  start_time, end_time: ISO datetime
+}
+
+
+┌─────────────────────────────────────────────────────────────────┐
+│                 IMPROVEMENTS & FIXES                             │
+└─────────────────────────────────────────────────────────────────┘
+
+1. INFINITE LOOP PREVENTION
+   ✓ Max 10 substeps per step
+   ✓ Duplicate plan detection (sliding window)
+   ✓ Stuck state detection (page không đổi 3 lần)
+   ✓ Consecutive failures limit (5)
+
+2. VALIDATION IMPROVEMENTS
+   ✓ LLM-based step validation
+   ✓ Confidence scoring (0.0-1.0)
+   ✓ Can override execution results
+   ✓ Evidence-based reasoning
+
+3. STATE MANAGEMENT
+   ✓ Proper step completion tracking
+   ✓ No state mutation in conditional edges
+   ✓ Separate helper nodes (CONTINUE_SUBSTEPS, MOVE_TO_NEXT_STEP)
+   ✓ Page state history tracking
+
+4. SAFETY FEATURES
+   ✓ Destructive action prevention (logout)
+   ✓ Post-execution verification
+   ✓ Multiple selector fallbacks
+   ✓ Error handling and recovery
+
+5. WORKFLOW ROBUSTNESS
+   ✓ Higher recursion limit (100)
+   ✓ Proper cleanup on error
+   ✓ Comprehensive logging
+   ✓ Status tracking at each node
+
+
+┌─────────────────────────────────────────────────────────────────┐
+│                      CONFIGURATION                               │
+└─────────────────────────────────────────────────────────────────┘
+
+Playwright Settings:
+  - headless: False (để debug, set True cho production)
+  - slow_mo: 500ms (slow down cho debugging)
+  - viewport: 1920x1080
+  - wait_until: 'domcontentloaded' | 'networkidle'
+
+LangGraph Settings:
+  - recursion_limit: 100 (default 25)
+  - checkpointer: None (không persist state)
+  - debug: False
+
+LLM:
+  - Model: GPT-4 (hoặc GPT-4 Vision)
+  - Used for: substep planning, script generation, validation
+  
+Limits:
+  - Max substeps per step: 10
+  - Max consecutive failures: 5
+  - Max consecutive no-change: 3
+  - Duplicate detection window: 3
+
+"""

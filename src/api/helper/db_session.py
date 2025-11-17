@@ -1,6 +1,6 @@
 from src.data.database.db_engine import SessionLocal, AsyncSessionLocal
 
-def getdb():
+def get_db():
     db = SessionLocal()
     try:
         yield db
