@@ -339,6 +339,7 @@ TABLE: login_info
    - SubSteps được generate TỪNG CÁI MỘT
    - Mỗi substep nhìn thấy trạng thái THỰC TẾ của page sau action trước
    - KHÔNG pre-plan toàn bộ substeps trước
+  - Substep có thể fail, workflow sẽ sinh tiếp substep mới cho đến khi đạt điều kiện kết thúc step hoặc vượt quá giới hạn
 
 2. CONTEXT AWARENESS
    - Trước mỗi substep, extract fresh page context
@@ -355,6 +356,7 @@ TABLE: login_info
    - Sử dụng LLM validation để check DOM/URL
    - Có thể override execution result nếu LLM confident
    - Prevent stuck states (duplicate plans, no page changes)
+  - Step có thể pass dù có substep fail, nếu trạng thái cuối cùng đạt yêu cầu (theo validation)
 
 5. LOOP PREVENTION
    - Max 10 substeps per step
@@ -362,6 +364,7 @@ TABLE: login_info
    - Stuck detection (3 lần page không đổi)
    - Consecutive failures limit (5)
    - Destructive action prevention
+  - Ghi nhận trạng thái pass/fail từng substep, tổng hợp lại cho step
 
 6. DATA FLOW
 6. DATA FLOW
@@ -420,6 +423,9 @@ TABLE: login_info
    └──────────────────────────────────────────────────┘
    
    → Step 1 COMPLETED → Move to Step 2
+  - Mỗi substep có trạng thái pass/fail riêng, lưu lại đầy đủ
+  - Step được coi là hoàn thành nếu validation cuối cùng đạt yêu cầu, bất kể có substep fail trước đó
+  - Log chi tiết từng substep, trạng thái, lý do pass/fail, evidence
 
 
 ┌─────────────────────────────────────────────────────────────────┐

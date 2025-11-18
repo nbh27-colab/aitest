@@ -4,8 +4,10 @@ LangGraph workflow nodes cho autotest
 
 import asyncio
 import os
-from typing import Dict, Any
+import tempfile
+from typing import Dict, Any, Optional
 from datetime import datetime
+from pathlib import Path
 from playwright.async_api import async_playwright
 
 from .state import AutoTestState
@@ -24,9 +26,60 @@ class AutoTestNodes:
         self.playwright_context = None
         self.browser = None
     
+    async def _upload_screenshot_to_minio(
+        self, 
+        screenshot_bytes: bytes, 
+        filename: str,
+        bucket_name: str = "testcase-bucket"
+    ) -> Optional[str]:
+        """
+        Upload screenshot to MinIO and return public URL
+        
+        Args:
+            screenshot_bytes: Screenshot image data as bytes
+            filename: Name for the screenshot file
+            bucket_name: MinIO bucket name (default: "testcase-bucket")
+            
+        Returns:
+            Public URL of uploaded screenshot or None if failed
+        """
+        try:
+            # Create temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
+                tmp_file.write(screenshot_bytes)
+                tmp_path = tmp_file.name
+            
+            try:
+                # Upload to MinIO in screenshots folder
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                remote_folder = f"screenshots/{datetime.now().strftime('%Y-%m-%d')}"
+                safe_filename = f"{timestamp}_{filename}"
+                
+                public_url, _ = self.minio_client.upload_file_from_path(
+                    bucket_name=bucket_name,
+                    local_file_path=tmp_path,
+                    remote_folder=remote_folder
+                )
+                
+                print(f"[MINIO] Screenshot uploaded: {public_url}")
+                return public_url
+                
+            finally:
+                # Clean up temp file
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                    
+        except Exception as e:
+            print(f"[MINIO] Failed to upload screenshot: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
     def _is_duplicate_plan(self, new_plan: Dict[str, Any], recent_plans: list, window: int = 3) -> bool:
         """
         Check if new plan is duplicate of recent plans
+        
+        ENHANCED: Now considers if plan is duplicate AND page state hasn't changed
         
         Args:
             new_plan: The newly generated substep plan
@@ -36,38 +89,108 @@ class AutoTestNodes:
         Returns:
             True if duplicate detected, False otherwise
         """
-        if len(recent_plans) < window:
+        if len(recent_plans) < 2:  # Need at least 2 to detect pattern
             return False
         
         # Get last N plans
         recent = recent_plans[-window:]
         
         new_action = new_plan.get('action_type', '')
-        new_selector = new_plan.get('target', {}).get('primary_selector', '')
+        new_selector = new_plan.get('target_element', {}).get('primary_selector', '')
         new_desc = new_plan.get('substep_description', '')
+        
+        duplicate_count = 0
         
         for plan in recent:
             plan_action = plan.get('action_type', '')
-            plan_selector = plan.get('target', {}).get('primary_selector', '')
+            plan_selector = plan.get('target_element', {}).get('primary_selector', '')
             plan_desc = plan.get('substep_description', '')
             
-            # Check if action + selector match
+            # Check if action + selector match (exact duplicate)
             if (plan_action == new_action and plan_selector == new_selector):
+                duplicate_count += 1
                 print(f"[DUPLICATE_CHECK] Found duplicate: {new_action} on {new_selector}")
-                return True
             
             # Also check if description is very similar (fuzzy match)
-            if new_desc and plan_desc:
+            elif new_desc and plan_desc:
                 # Simple similarity: check if 80% of words overlap
                 new_words = set(new_desc.lower().split())
                 plan_words = set(plan_desc.lower().split())
                 if len(new_words) > 0:
                     overlap = len(new_words & plan_words) / len(new_words)
                     if overlap > 0.8:
+                        duplicate_count += 1
                         print(f"[DUPLICATE_CHECK] Found similar description: {overlap:.0%} overlap")
-                        return True
+        
+        # If we've tried the same action 2+ times recently, it's a duplicate
+        if duplicate_count >= 2:
+            print(f"[DUPLICATE_CHECK] Pattern detected: tried same action {duplicate_count} times")
+            return True
         
         return False
+    
+    async def _detect_intermediate_progress(self, page, substep_plan: Dict[str, Any]) -> Optional[str]:
+        """
+        Detect if action made intermediate progress even if final goal not reached
+        
+        Examples of intermediate progress:
+        - Click "Create Bucket" → Modal opened (even if bucket not created yet)
+        - Click "Add User" → Form appeared (even if user not added yet)
+        - Fill email → Submit button enabled (even if form not submitted yet)
+        
+        Returns:
+            Description of intermediate progress, or None if no progress detected
+        """
+        try:
+            action_type = substep_plan.get('action_type', '')
+            
+            # Common intermediate states to check
+            intermediate_checks = {
+                'modal_opened': [
+                    '.modal', '[role="dialog"]', '.dialog', '.popup',
+                    '[aria-modal="true"]', '.overlay'
+                ],
+                'form_visible': [
+                    'form', '.form-container', '[role="form"]',
+                    'input[type="text"]', 'input[type="email"]'
+                ],
+                'button_enabled': [
+                    'button:not([disabled])', 
+                    'button[aria-disabled="false"]',
+                    'input[type="submit"]:not([disabled])'
+                ],
+                'dropdown_opened': [
+                    '[role="listbox"]', '.dropdown-menu',
+                    'select[aria-expanded="true"]', 'ul.options'
+                ],
+                'loading_completed': [
+                    ':not(.loading)', ':not([aria-busy="true"])'
+                ]
+            }
+            
+            # Check each intermediate state
+            progress_detected = []
+            for state_name, selectors in intermediate_checks.items():
+                for selector in selectors:
+                    try:
+                        count = await page.locator(selector).count()
+                        if count > 0 and state_name not in ['loading_completed']:
+                            # Verify element is actually visible
+                            is_visible = await page.locator(selector).first.is_visible()
+                            if is_visible:
+                                progress_detected.append(state_name.replace('_', ' '))
+                                break
+                    except:
+                        continue
+            
+            if progress_detected:
+                return f"{', '.join(set(progress_detected))}"
+            
+            return None
+            
+        except Exception as e:
+            print(f"[INTERMEDIATE_PROGRESS] Error checking: {e}")
+            return None
     
     async def initialize(self, state: AutoTestState) -> AutoTestState:
         """
@@ -100,7 +223,7 @@ class AutoTestNodes:
                 slow_mo=500  # Slow down for debugging
             )
             context = await self.browser.new_context(
-                viewport={'width': 1920, 'height': 1080}
+                viewport={'width': 1080, 'height': 720}
             )
             page = await context.new_page()
             
@@ -130,11 +253,18 @@ class AutoTestNodes:
     
     async def auto_login(self, state: AutoTestState) -> AutoTestState:
         """
-        Node 2: Tự động đăng nhập
-        - Mở web_url
-        - Generate và execute login script
+        Node 2: Tự động đăng nhập thông minh với LLM
+        - Hỗ trợ multi-step login (Microsoft, Google, AWS, etc.)
+        - Tự động phát hiện login flow
+        - Sử dụng LLM để generate actions
+        
+        Hỗ trợ:
+        - Simple form (email + password cùng page)
+        - Multi-step (email → next → password)
+        - OAuth/SSO redirects
+        - Dynamic selectors
         """
-        print(f"[AUTO_LOGIN] Starting auto login")
+        print(f"[AUTO_LOGIN] Starting intelligent auto login")
         
         try:
             page = state['page']
@@ -145,83 +275,333 @@ class AutoTestNodes:
             await page.goto(login_info['web_url'], wait_until='domcontentloaded')
             await page.wait_for_timeout(2000)
             
-            # Simple login script generation
-            # TODO: Make this more intelligent with LLM
-            print(f"[AUTO_LOGIN] Attempting to fill login form")
+            # Take initial screenshot and upload to MinIO
+            screenshot_bytes = await page.screenshot(type='png', full_page=False)
+            screenshot_url = await self._upload_screenshot_to_minio(
+                screenshot_bytes=screenshot_bytes,
+                filename='login_page_initial.png'
+            )
+            if screenshot_url:
+                state['login_initial_screenshot_url'] = screenshot_url
+                print(f"[AUTO_LOGIN] Initial screenshot saved: {screenshot_url}")
             
-            # Try common login selectors
-            email_selectors = [
-                'input[name="email"]',
-                'input[type="email"]',
-                'input[name="username"]',
-                'input[name="accessKey"]',  # MinIO uses accessKey
-                '#email',
-                '#username',
-                '#accessKey'
-            ]
+            # Initialize login state tracking
+            login_state = {
+                'email_entered': False,
+                'password_entered': False,
+                'submitted': False,
+                'current_url': page.url,
+                'attempts': 0,
+                'max_attempts': 10,  # Prevent infinite loops
+                'executed_actions': []  # Track all actions for creating substeps
+            }
             
-            password_selectors = [
-                'input[name="password"]',
-                'input[type="password"]',
-                'input[name="secretKey"]',  # MinIO uses secretKey
-                '#password',
-                '#secretKey'
-            ]
-            
-            submit_selectors = [
-                'button[type="submit"]',
-                'input[type="submit"]',
-                'button:has-text("login")',
-                'button:has-text("sign in")',
-                '.login-button',
-                '#login-button'
-            ]
-            
-            # Fill email
-            for selector in email_selectors:
-                try:
-                    await page.wait_for_selector(selector, timeout=2000, state='visible')
-                    await page.fill(selector, login_info['email'])
-                    print(f"[AUTO_LOGIN] Filled email with selector: {selector}")
+            # Login workflow loop - handle multi-step login
+            while not login_state['submitted'] and login_state['attempts'] < login_state['max_attempts']:
+                login_state['attempts'] += 1
+                print(f"\n[AUTO_LOGIN] Login attempt {login_state['attempts']}/{login_state['max_attempts']}")
+                
+                # Get current page context
+                context = await get_page_context(page, [])
+                
+                # Determine what to do next using LLM
+                login_action = await self.llm_generator.generate_login_action(
+                    login_info=login_info,
+                    page_context=context,
+                    login_state=login_state
+                )
+                
+                print(f"[AUTO_LOGIN] LLM Action: {login_action['action_type']}")
+                print(f"[AUTO_LOGIN] Reason: {login_action['reason']}")
+                
+                # Execute the action
+                if login_action['action_type'] == 'enter_email':
+                    selector = login_action['target']['primary_selector']
+                    try:
+                        await page.wait_for_selector(selector, timeout=5000, state='visible')
+                        await page.fill(selector, login_info['email'])
+                        login_state['email_entered'] = True
+                        print(f"[AUTO_LOGIN] ✓ Filled email: {selector}")
+                        await page.wait_for_timeout(1000)
+                        
+                        # Track this action
+                        login_state['executed_actions'].append({
+                            'action_type': 'enter_email',
+                            'selector': selector,
+                            'success': True,
+                            'description': f"Fill email field with '{login_info['email']}'"
+                        })
+                    except Exception as e:
+                        print(f"[AUTO_LOGIN] ✗ Failed to fill email: {e}")
+                        login_state['executed_actions'].append({
+                            'action_type': 'enter_email',
+                            'selector': selector,
+                            'success': False,
+                            'error': str(e),
+                            'description': f"Attempt to fill email field (failed)"
+                        })
+                
+                elif login_action['action_type'] == 'enter_password':
+                    selector = login_action['target']['primary_selector']
+                    try:
+                        await page.wait_for_selector(selector, timeout=5000, state='visible')
+                        await page.fill(selector, login_info['password'])
+                        login_state['password_entered'] = True
+                        print(f"[AUTO_LOGIN] ✓ Filled password: {selector}")
+                        await page.wait_for_timeout(1000)
+                        
+                        # Track this action
+                        login_state['executed_actions'].append({
+                            'action_type': 'enter_password',
+                            'selector': selector,
+                            'success': True,
+                            'description': f"Fill password field"
+                        })
+                    except Exception as e:
+                        print(f"[AUTO_LOGIN] ✗ Failed to fill password: {e}")
+                        login_state['executed_actions'].append({
+                            'action_type': 'enter_password',
+                            'selector': selector,
+                            'success': False,
+                            'error': str(e),
+                            'description': f"Attempt to fill password field (failed)"
+                        })
+                
+                elif login_action['action_type'] == 'click_next':
+                    selector = login_action['target']['primary_selector']
+                    try:
+                        await page.wait_for_selector(selector, timeout=5000, state='visible')
+                        await page.click(selector)
+                        print(f"[AUTO_LOGIN] ✓ Clicked next: {selector}")
+                        # Wait for page transition
+                        await page.wait_for_load_state('networkidle', timeout=10000)
+                        await page.wait_for_timeout(2000)
+                        
+                        # Track this action
+                        login_state['executed_actions'].append({
+                            'action_type': 'click_next',
+                            'selector': selector,
+                            'success': True,
+                            'description': f"Click 'Next' button"
+                        })
+                    except Exception as e:
+                        print(f"[AUTO_LOGIN] ✗ Failed to click next: {e}")
+                        login_state['executed_actions'].append({
+                            'action_type': 'click_next',
+                            'selector': selector,
+                            'success': False,
+                            'error': str(e),
+                            'description': f"Attempt to click 'Next' button (failed)"
+                        })
+                
+                elif login_action['action_type'] == 'click_submit':
+                    selector = login_action['target']['primary_selector']
+                    try:
+                        await page.wait_for_selector(selector, timeout=5000, state='visible')
+                        await page.click(selector)
+                        print(f"[AUTO_LOGIN] ✓ Clicked submit: {selector}")
+                        login_state['submitted'] = True
+                        # Wait for login to complete
+                        await page.wait_for_load_state('networkidle', timeout=15000)
+                        await page.wait_for_timeout(3000)
+                        
+                        # Track this action
+                        login_state['executed_actions'].append({
+                            'action_type': 'click_submit',
+                            'selector': selector,
+                            'success': True,
+                            'description': f"Click login/submit button"
+                        })
+                    except Exception as e:
+                        print(f"[AUTO_LOGIN] ✗ Failed to click submit: {e}")
+                        login_state['executed_actions'].append({
+                            'action_type': 'click_submit',
+                            'selector': selector,
+                            'success': False,
+                            'error': str(e),
+                            'description': f"Attempt to click login/submit button (failed)"
+                        })
+                
+                elif login_action['action_type'] == 'wait_for_redirect':
+                    print(f"[AUTO_LOGIN] ⏳ Waiting for OAuth/SSO redirect...")
+                    await page.wait_for_load_state('networkidle', timeout=15000)
+                    await page.wait_for_timeout(2000)
+                
+                elif login_action['action_type'] == 'completed':
+                    print(f"[AUTO_LOGIN] ✓ Login detected as completed")
+                    login_state['submitted'] = True
                     break
-                except:
-                    continue
+                
+                elif login_action['action_type'] == 'error':
+                    print(f"[AUTO_LOGIN] ✗ Error detected: {login_action['reason']}")
+                    raise Exception(login_action['reason'])
+                
+                # Update current URL
+                login_state['current_url'] = page.url
             
-            # Fill password
-            for selector in password_selectors:
-                try:
-                    await page.wait_for_selector(selector, timeout=2000, state='visible')
-                    await page.fill(selector, login_info['password'])
-                    print(f"[AUTO_LOGIN] Filled password with selector: {selector}")
-                    break
-                except:
-                    continue
-            
-            # Click submit
-            for selector in submit_selectors:
-                try:
-                    await page.wait_for_selector(selector, timeout=2000, state='visible')
-                    await page.click(selector)
-                    print(f"[AUTO_LOGIN] Clicked submit with selector: {selector}")
-                    break
-                except:
-                    continue
-            
-            # Wait for navigation
-            await page.wait_for_load_state('networkidle', timeout=10000)
+            # Verify login success
             await page.wait_for_timeout(2000)
             
-            # Take screenshot
-            screenshot_path = 'login_success.png'
-            await page.screenshot(path=screenshot_path)
+            # Take screenshot and upload to MinIO
+            screenshot_bytes = await page.screenshot(type='png', full_page=False)
+            screenshot_url = await self._upload_screenshot_to_minio(
+                screenshot_bytes=screenshot_bytes,
+                filename='login_success.png'
+            )
             
-            # Upload to MinIO
-            # TODO: Implement MinIO upload
+            # Validate login using LLM
+            context = await get_page_context(page, [])
+            validation = await self.llm_generator.validate_login_success(
+                page_context=context,
+                initial_url=login_info['web_url'],
+                current_url=page.url
+            )
             
-            state['login_completed'] = True
+            if validation['is_logged_in']:
+                print(f"[AUTO_LOGIN] ✓ Login verified successful: {validation['reason']}")
+                state['login_completed'] = True
+            else:
+                print(f"[AUTO_LOGIN] ⚠ Login may have failed: {validation['reason']}")
+                # Continue anyway, maybe manual verification needed
+                state['login_completed'] = True
+                state['error_message'] = f"Login verification uncertain: {validation['reason']}"
             
-            # Check if Step 1 is "Login to Minio" or similar
-            # If so, mark it as completed to skip it
+            # Create substep and generated_script for login to save properly to database
+            if state.get('steps'):
+                try:
+                    first_step = state['steps'][0]
+                    
+                    # Create separate substeps for each executed action
+                    substep_order = 1
+                    created_substeps = []
+                    
+                    for action in login_state['executed_actions']:
+                        # Create substep for each action
+                        login_substep = self.repository.create_substep(
+                            step_id=first_step['step_id'],
+                            sub_step_order=substep_order,
+                            sub_step_content=action['description'],
+                            expected_result=f"Successfully {action['action_type'].replace('_', ' ')}"
+                        )
+                        print(f"[AUTO_LOGIN] Created login substep {substep_order}: substep_id={login_substep.sub_step_id}")
+                        
+                        # Generate Playwright script content for this action
+                        if action['action_type'] in ['enter_email', 'enter_password']:
+                            script_content = f"""# Auto-generated login script - {action['description']}
+async def execute(page):
+    selector = "{action['selector']}"
+    await page.wait_for_selector(selector, timeout=5000, state='visible')
+    await page.fill(selector, "{'***' if 'password' in action['action_type'] else action.get('value', 'email')}")
+    await page.wait_for_timeout(1000)
+"""
+                        elif action['action_type'] in ['click_submit', 'click_next']:
+                            script_content = f"""# Auto-generated login script - {action['description']}
+async def execute(page):
+    selector = "{action['selector']}"
+    await page.wait_for_selector(selector, timeout=5000, state='visible')
+    await page.click(selector)
+    await page.wait_for_load_state('networkidle', timeout=15000)
+    await page.wait_for_timeout(2000)
+"""
+                        else:
+                            script_content = f"""# Auto-generated login script - {action['description']}
+# Action type: {action['action_type']}
+# Success: {action['success']}
+"""
+                        
+                        # Create generated script for this action
+                        login_script = self.repository.create_generated_script(
+                            sub_step_id=login_substep.sub_step_id,
+                            script_content=script_content
+                        )
+                        print(f"[AUTO_LOGIN] Created login script {substep_order}: script_id={login_script.generated_script_id}")
+                        
+                        # Save test result for this action
+                        self.repository.create_test_result(
+                            object_id=login_substep.sub_step_id,
+                            object_type='sub_step',
+                            result=action['success'],
+                            reason=action.get('error', 'Action executed successfully')
+                        )
+                        
+                        created_substeps.append({
+                            'substep': login_substep,
+                            'script': login_script,
+                            'action': action
+                        })
+                        
+                        substep_order += 1
+                    
+                    # Create final validation substep
+                    validation_substep = self.repository.create_substep(
+                        step_id=first_step['step_id'],
+                        sub_step_order=substep_order,
+                        sub_step_content="Verify login successful",
+                        expected_result="User is logged in to the application"
+                    )
+                    print(f"[AUTO_LOGIN] Created validation substep {substep_order}: substep_id={validation_substep.sub_step_id}")
+                    
+                    # Create script for validation
+                    validation_script_content = f"""# Auto-generated login validation
+# Login attempts: {login_state['attempts']}
+# Email entered: {login_state['email_entered']}
+# Password entered: {login_state['password_entered']}
+# Final URL: {page.url}
+# Validation result: {validation['is_logged_in']}
+# Validation reason: {validation['reason']}
+"""
+                    validation_script = self.repository.create_generated_script(
+                        sub_step_id=validation_substep.sub_step_id,
+                        script_content=validation_script_content
+                    )
+                    print(f"[AUTO_LOGIN] Created validation script {substep_order}: script_id={validation_script.generated_script_id}")
+                    
+                    # Save login screenshot to validation substep
+                    if screenshot_url:
+                        self.repository.create_screenshot(
+                            generated_script_id=validation_script.generated_script_id,
+                            screenshot_link=screenshot_url
+                        )
+                        state['login_screenshot_url'] = screenshot_url
+                        print(f"[AUTO_LOGIN] Screenshot saved to database: {screenshot_url}")
+                    
+                    # Save test result for validation
+                    self.repository.create_test_result(
+                        object_id=validation_substep.sub_step_id,
+                        object_type='sub_step',
+                        result=validation['is_logged_in'],
+                        reason=validation['reason']
+                    )
+                    print(f"[AUTO_LOGIN] Test result saved: {validation['is_logged_in']}")
+                    
+                    # Add each action to execution results
+                    for item in created_substeps:
+                        state['execution_results'].append({
+                            'success': item['action']['success'],
+                            'screenshot_url': None,  # Individual actions don't have screenshots
+                            'message': item['action']['description'],
+                            'page_url': page.url,
+                            'timestamp': datetime.now().isoformat()
+                        })
+                    
+                    # Add validation to execution results
+                    state['execution_results'].append({
+                        'success': validation['is_logged_in'],
+                        'screenshot_url': screenshot_url,
+                        'message': validation['reason'],
+                        'page_url': page.url,
+                        'timestamp': datetime.now().isoformat()
+                    })
+                    
+                except Exception as db_error:
+                    print(f"[AUTO_LOGIN] Failed to save to database: {db_error}")
+                    import traceback
+                    traceback.print_exc()
+                    # Still save screenshot URL to state
+                    if screenshot_url:
+                        state['login_screenshot_url'] = screenshot_url
+            
+            # Check if Step 1 is login-related and mark as completed
             if state['steps']:
                 first_step = state['steps'][0]
                 step_action = first_step.get('action', '').strip().lower()
@@ -229,10 +609,8 @@ class AutoTestNodes:
                 
                 print(f"[AUTO_LOGIN] Checking Step {step_order} action: '{step_action}'")
                 
-                # Check if step is about login (or if it's step 1 with empty action)
-                # Step 1 is often the login step even if action field is empty
                 is_login_step = (
-                    any(keyword in step_action for keyword in ['login', 'đăng nhập', 'sign in', 'log in', 'minio']) or
+                    any(keyword in step_action for keyword in ['login', 'đăng nhập', 'sign in', 'log in', 'minio', 'authenticate']) or
                     (step_order == 1 and not step_action)  # Empty step 1 is likely login
                 )
                 
@@ -240,17 +618,80 @@ class AutoTestNodes:
                     print(f"[AUTO_LOGIN] Step {step_order} detected as login step, marking as completed")
                     if 0 not in state['completed_steps']:
                         state['completed_steps'].append(0)
-                    state['current_step_index'] = 1  # Skip to step 2 (index 1)
+                    state['current_step_index'] = 1  # Skip to step 2
                     print(f"[AUTO_LOGIN] Skipping to Step 2, completed_steps: {state['completed_steps']}")
-                else:
-                    print(f"[AUTO_LOGIN] Step {step_order} is not a login step, will execute normally")
             
-            print(f"[AUTO_LOGIN] Login completed successfully")
-            
+            print(f"[AUTO_LOGIN] Login process completed")
             return state
             
         except Exception as e:
             print(f"[AUTO_LOGIN] Error: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Take error screenshot and upload to MinIO
+            error_screenshot_url = None
+            try:
+                screenshot_bytes = await page.screenshot(type='png', full_page=False)
+                error_screenshot_url = await self._upload_screenshot_to_minio(
+                    screenshot_bytes=screenshot_bytes,
+                    filename='login_error.png'
+                )
+                if error_screenshot_url:
+                    print(f"[AUTO_LOGIN] Error screenshot uploaded: {error_screenshot_url}")
+            except Exception as screenshot_error:
+                print(f"[AUTO_LOGIN] Failed to capture error screenshot: {screenshot_error}")
+            
+            # Save error to database (create substep and result for failed login)
+            if state.get('steps') and error_screenshot_url:
+                try:
+                    first_step = state['steps'][0]
+                    
+                    # Create login substep for error case
+                    login_substep = self.repository.create_substep(
+                        step_id=first_step['step_id'],
+                        sub_step_order=1,
+                        sub_step_content="Auto login using LLM (FAILED)",
+                        expected_result="Successfully logged in to the application"
+                    )
+                    
+                    # Create generated script for failed login
+                    error_script = self.repository.create_generated_script(
+                        sub_step_id=login_substep.sub_step_id,
+                        script_content=f"# Login failed with error:\n# {str(e)}"
+                    )
+                    
+                    # Save error screenshot to database
+                    self.repository.create_screenshot(
+                        generated_script_id=error_script.generated_script_id,
+                        screenshot_link=error_screenshot_url
+                    )
+                    
+                    # Save test result as failure
+                    self.repository.create_test_result(
+                        object_id=login_substep.sub_step_id,
+                        object_type='sub_step',
+                        result=False,
+                        reason=f"Login failed: {str(e)}"
+                    )
+                    
+                    # Add to execution results
+                    state['execution_results'].append({
+                        'success': False,
+                        'screenshot_url': error_screenshot_url,
+                        'message': f"Login failed: {str(e)}",
+                        'error': str(e),
+                        'page_url': page.url if page else 'unknown',
+                        'timestamp': datetime.now().isoformat()
+                    })
+                    
+                    print(f"[AUTO_LOGIN] Error saved to database")
+                except Exception as db_error:
+                    print(f"[AUTO_LOGIN] Failed to save error to database: {db_error}")
+            
+            if error_screenshot_url:
+                state['login_error_screenshot_url'] = error_screenshot_url
+            
             state['error_message'] = f"Login failed: {str(e)}"
             # Continue anyway, maybe login is not required
             state['login_completed'] = True
@@ -259,6 +700,8 @@ class AutoTestNodes:
     async def get_current_context(self, state: AutoTestState) -> AutoTestState:
         """
         Node 3: Lấy context của page hiện tại
+        
+        ENHANCED: Track page state changes to detect stuck situations
         """
         # Check if we've finished all steps
         if state.get('overall_status') == 'completed' or state['current_step_index'] >= len(state['steps']):
@@ -274,6 +717,40 @@ class AutoTestNodes:
             
             print(f"[GET_CONTEXT] Current URL: {context['current_url']}")
             print(f"[GET_CONTEXT] Found {len(context['visible_elements'])} interactive elements")
+            
+            # NEW: Track page state for stuck detection
+            current_url = context['current_url']
+            current_html = await page.content()
+            current_html_hash = hash(current_html[:5000])  # Hash first 5000 chars for efficiency
+            
+            # Initialize tracking if not exists
+            if 'page_state_tracking' not in state:
+                state['page_state_tracking'] = []
+            
+            # Add current state to tracking
+            current_state = {
+                'url': current_url,
+                'html_hash': current_html_hash,
+                'element_count': len(context['visible_elements']),
+                'timestamp': datetime.now().isoformat()
+            }
+            state['page_state_tracking'].append(current_state)
+            
+            # Keep only last 5 states
+            if len(state['page_state_tracking']) > 5:
+                state['page_state_tracking'] = state['page_state_tracking'][-5:]
+            
+            # Check if page is stuck (no changes in last 3 attempts)
+            if len(state['page_state_tracking']) >= 3:
+                last_3 = state['page_state_tracking'][-3:]
+                urls = [s['url'] for s in last_3]
+                hashes = [s['html_hash'] for s in last_3]
+                
+                if len(set(urls)) == 1 and len(set(hashes)) == 1:
+                    print(f"[GET_CONTEXT] ⚠️ Page stuck detected - no changes in last 3 attempts")
+                    state['page_stuck_detected'] = True
+                else:
+                    state['page_stuck_detected'] = False
             
             return state
             
@@ -317,12 +794,25 @@ class AutoTestNodes:
         print(f"[GENERATE_SUBSTEP] Generating substep {substep_index + 1}")
         print(f"[GENERATE_SUBSTEP] Completed steps: {state.get('completed_steps', [])}")
         
+        # NEW: Check if page is stuck before generating more substeps
+        if state.get('page_stuck_detected') and substep_index >= 2:
+            print(f"[GENERATE_SUBSTEP] ⚠️ Page stuck detected and already tried {substep_index + 1} substeps")
+            print(f"[GENERATE_SUBSTEP] Forcing step completion to avoid infinite loop")
+            state['last_validation'] = {
+                "is_completed": True,
+                "confidence": 0.5,
+                "reason": "Page state not changing despite multiple attempts, assuming completed or impossible",
+                "evidence": "No DOM changes detected in last 3 context extractions"
+            }
+            return state
+        
         try:
             # Generate substep plan với LLM
             substep_plan = await self.llm_generator.generate_substep_plan(
                 step=current_step,
                 context=state['page_context'],
-                substep_index=substep_index
+                substep_index=substep_index,
+                page_stuck=state.get('page_stuck_detected', False)
             )
             
             # NEW: Check for duplicate plans (same action/target as recent substeps)
@@ -455,6 +945,7 @@ class AutoTestNodes:
             print(f"[EXECUTE] Result: {result['success']} - {result['message']}")
             
             # POST-ACTION VERIFICATION: Check if page state changed positively despite failure
+            # ENHANCED: Also detect intermediate progress (modal opened, form visible, etc.)
             if not result['success'] and state['substep_plans']:
                 # Wait and re-verify
                 await page.wait_for_timeout(1000)
@@ -466,7 +957,7 @@ class AutoTestNodes:
                 print(f"[POST-VERIFY] Re-checking verification after apparent failure")
                 
                 # Re-check verification conditions
-                if verification.get('type') == 'url_contains':
+                if verification.get('check_type') == 'url_contains':
                     expected_url = verification.get('expected', '')
                     current_url = page.url
                     if expected_url and expected_url in current_url:
@@ -474,7 +965,7 @@ class AutoTestNodes:
                         result['success'] = True
                         result['message'] += " (verified post-action)"
                 
-                elif verification.get('type') == 'element_visible':
+                elif verification.get('check_type') == 'element_visible':
                     selector = verification.get('selector', '')
                     try:
                         await page.wait_for_selector(selector, timeout=2000, state='visible')
@@ -484,7 +975,7 @@ class AutoTestNodes:
                     except:
                         print(f"[POST-VERIFY] Element still not visible")
                 
-                elif verification.get('type') == 'element_not_visible':
+                elif verification.get('check_type') == 'element_not_visible':
                     selector = verification.get('selector', '')
                     try:
                         await page.wait_for_selector(selector, timeout=2000, state='hidden')
@@ -493,6 +984,15 @@ class AutoTestNodes:
                         result['message'] += " (verified post-action)"
                     except:
                         print(f"[POST-VERIFY] Element still visible")
+                
+                # NEW: Detect intermediate progress even if final goal not reached
+                # This helps LLM understand we're making progress
+                if not result['success']:
+                    intermediate_progress = await self._detect_intermediate_progress(page, current_plan)
+                    if intermediate_progress:
+                        print(f"[POST-VERIFY] Intermediate progress detected: {intermediate_progress}")
+                        result['intermediate_progress'] = intermediate_progress
+                        result['message'] += f" (intermediate: {intermediate_progress})"
             
             # Update consecutive failures counter
             if result['success']:
@@ -503,15 +1003,30 @@ class AutoTestNodes:
             # Store current page URL in result for comparison
             result['page_url'] = page.url
             
-            # Save screenshot to MinIO
-            # TODO: Upload screenshot to MinIO and save link
-            screenshot_link = result.get('screenshot_path', '')
-            
-            if screenshot_link:
-                self.repository.create_screenshot(
-                    generated_script_id=generated_script.generated_script_id,
-                    screenshot_link=screenshot_link
+            # Capture screenshot after execution (both success and failure)
+            screenshot_url = None
+            try:
+                screenshot_bytes = await page.screenshot(type='png', full_page=False)
+                status = 'success' if result['success'] else 'error'
+                screenshot_filename = f'substep_{substep_id}_{status}.png'
+                screenshot_url = await self._upload_screenshot_to_minio(
+                    screenshot_bytes=screenshot_bytes,
+                    filename=screenshot_filename
                 )
+                
+                if screenshot_url:
+                    print(f"[EXECUTE] Screenshot saved: {screenshot_url}")
+                    result['screenshot_url'] = screenshot_url
+                    
+                    # Save screenshot to database
+                    self.repository.create_screenshot(
+                        generated_script_id=generated_script.generated_script_id,
+                        screenshot_link=screenshot_url
+                    )
+                    
+            except Exception as screenshot_error:
+                print(f"[EXECUTE] Failed to capture/upload screenshot: {screenshot_error}")
+                result['screenshot_url'] = None
             
             # Save test result
             self.repository.create_test_result(
@@ -528,11 +1043,29 @@ class AutoTestNodes:
             
         except Exception as e:
             print(f"[EXECUTE] Error: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Try to capture error screenshot
+            screenshot_url = None
+            try:
+                page = state.get('page')
+                if page:
+                    screenshot_bytes = await page.screenshot(type='png', full_page=False)
+                    substep_id = state.get('current_substep_id', 'unknown')
+                    screenshot_url = await self._upload_screenshot_to_minio(
+                        screenshot_bytes=screenshot_bytes,
+                        filename=f'substep_{substep_id}_exception.png'
+                    )
+                    if screenshot_url:
+                        print(f"[EXECUTE] Exception screenshot saved: {screenshot_url}")
+            except Exception as screenshot_error:
+                print(f"[EXECUTE] Failed to capture exception screenshot: {screenshot_error}")
             
             # Record failure
             result = {
                 'success': False,
-                'screenshot_path': None,
+                'screenshot_url': screenshot_url,
                 'message': f"Execution failed: {str(e)}",
                 'error': str(e),
                 'timestamp': datetime.now().isoformat()

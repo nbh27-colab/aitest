@@ -31,8 +31,42 @@ class PrivateS3:
             if error_code == 404:
                 print(f"[INFO] Bucket '{bucket_name}' does not exist. Creating new bucket.")
                 s3_client.create_bucket(Bucket=bucket_name)
+                # Set bucket policy to allow public read access
+                self.set_bucket_public_read_policy(bucket_name)
             else:
                 raise e
+    
+    def set_bucket_public_read_policy(self, bucket_name: str) -> None:
+        """Set bucket policy to allow public read access"""
+        import json
+        
+        s3_client = self.s3_resource.meta.client
+        bucket_policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "*"},
+                    "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
+                    "Resource": f"arn:aws:s3:::{bucket_name}"
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "*"},
+                    "Action": "s3:GetObject",
+                    "Resource": f"arn:aws:s3:::{bucket_name}/*"
+                }
+            ]
+        }
+        
+        try:
+            s3_client.put_bucket_policy(
+                Bucket=bucket_name,
+                Policy=json.dumps(bucket_policy)
+            )
+            print(f"[INFO] Set public read policy for bucket '{bucket_name}'")
+        except ClientError as e:
+            print(f"[WARNING] Could not set bucket policy: {e}")
 
     def upload_file(self, bucket_name: str, data: bytes,remote_file_path: str) -> None:
         self.ensure_bucket_exists(bucket_name)

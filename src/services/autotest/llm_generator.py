@@ -19,7 +19,8 @@ class LLMGenerator:
         self, 
         step: Dict[str, Any], 
         context: Dict[str, Any],
-        substep_index: int
+        substep_index: int,
+        page_stuck: bool = False
     ) -> Dict[str, Any]:
         """
         Sử dụng LLM để generate kế hoạch cho substep tiếp theo
@@ -34,8 +35,15 @@ class LLMGenerator:
         
         # Extract error patterns from previous failures to help LLM avoid them
         error_learnings = []
+        intermediate_progress = []
+        
         if context.get('previous_results'):
             for result in context['previous_results']:
+                # Track intermediate progress
+                if result.get('intermediate_progress'):
+                    intermediate_progress.append(result['intermediate_progress'])
+                
+                # Track errors
                 if not result['success'] and result.get('error'):
                     error = result['error']
                     if 'not a valid selector' in error or 'SyntaxError' in error:
@@ -48,6 +56,31 @@ class LLMGenerator:
         
         error_context = "\n".join(list(set(error_learnings)))  # Remove duplicates
         
+        # Build intermediate progress context
+        progress_context = ""
+        if intermediate_progress:
+            unique_progress = list(set(intermediate_progress))
+            progress_context = f"""
+✅ INTERMEDIATE PROGRESS DETECTED:
+{chr(10).join(f"- {p}" for p in unique_progress)}
+
+This means previous actions ARE working, even if final goal not reached yet.
+BUILD ON this progress - don't repeat actions that already succeeded in changing page state.
+"""
+        
+        # Add page stuck warning
+        stuck_warning = ""
+        if page_stuck:
+            stuck_warning = """
+⚠️ PAGE STATE NOT CHANGING:
+The page has not changed in the last few attempts. This could mean:
+1. The goal is already achieved (verify completion)
+2. We're stuck in a loop (try a completely different approach)
+3. The action is impossible with current page state (mark as final)
+
+CRITICAL: Do NOT repeat previous actions. Either verify completion or try a fundamentally different approach.
+"""
+        
         prompt = f"""You are an expert test automation engineer generating the NEXT immediate action for a web test.
 
 OVERALL GOAL: {step.get('action', '')}
@@ -56,6 +89,7 @@ EXPECTED RESULT: {step.get('expected_result', '')}
 CURRENT PAGE STATE:
 {context_text}
 
+{progress_context}{stuck_warning}
 {f'''
 ⚠️ LEARNED FROM PREVIOUS ERRORS:
 {error_context}
@@ -104,17 +138,25 @@ Respond ONLY with valid JSON in this exact format:
     "verification": {{
         "check_type": "element_visible|element_not_visible|text_contains|url_contains|element_count|attribute_value",
         "expected": "What to expect after this action",
-        "selector": "Element to verify (if applicable)"
+        "selector": "Element to verify (if applicable)",
+        "attribute": "Attribute name (for attribute_value check, e.g., 'disabled', 'aria-disabled', 'class')"
     }},
     "is_final_substep": true/false,
     "reasoning": "Brief explanation based on HTML structure and goal"
 }}
+
+VERIFICATION EXAMPLES:
+- Button enabled after fill: {{"check_type": "attribute_value", "selector": "#submit-btn", "attribute": "disabled", "expected": "false"}}
+- Element has class: {{"check_type": "attribute_value", "selector": ".item", "attribute": "class", "expected": "active"}}
+- Element visible: {{"check_type": "element_visible", "selector": ".modal"}}
+- URL changed: {{"check_type": "url_contains", "expected": "/dashboard"}}
 
 IMPORTANT:
 1. Use the HTML structure to find correct selectors
 2. Learn from previous failed selectors - try different approaches
 3. Consider page state changes (modals, overlays, dynamic content)
 4. Set is_final_substep=true when goal is achieved
+5. Use attribute_value check when verifying enabled/disabled state, classes, or other attributes
 """
 
         try:
@@ -227,9 +269,10 @@ async def execute_substep_{substep_id}(page):
             verify_selector = "{verification.get('selector', target['primary_selector'])}"
             action_type = "{action_type}"
             
-            # IMPORTANT: Don't pre-check element visibility for click actions
-            # because the element must be visible BEFORE clicking
-            if action_type != "click":
+            # CRITICAL: Only pre-check element visibility for VERIFY actions
+            # For click/fill/other actions, element visibility is a POST-condition, not PRE-condition
+            # Example: "Fill input" → verify "Submit button enabled" (button exists before fill!)
+            if action_type == "verify":
                 try:
                     await page.wait_for_selector(verify_selector, timeout=2000, state='visible')
                     is_visible = await page.locator(verify_selector).is_visible()
@@ -264,6 +307,36 @@ async def execute_substep_{substep_id}(page):
                         }}
                 except:
                     pass
+        
+        # Priority 4: Check attribute value (e.g., button enabled/disabled)
+        # ONLY pre-check for verify actions, not fill/click actions
+        elif verification_check_type == "attribute_value":
+            verify_selector = "{verification.get('selector', '')}"
+            attribute_name = "{verification.get('attribute', 'disabled')}"
+            expected_value = "{verification.get('expected', 'false')}"
+            action_type = "{action_type}"
+            
+            if action_type == "verify" and verify_selector:
+                try:
+                    await page.wait_for_selector(verify_selector, timeout=2000, state='visible')
+                    element = page.locator(verify_selector)
+                    
+                    if attribute_name == "disabled":
+                        is_disabled = await element.is_disabled()
+                        expected_enabled = expected_value.lower() in ["false", "no", "enabled"]
+                        
+                        if (expected_enabled and not is_disabled) or (not expected_enabled and is_disabled):
+                            print(f"[PRE-CHECK] Attribute already correct, goal achieved")
+                            screenshot_path = f"substep_{substep_id}_precheck_success.png"
+                            await page.screenshot(path=screenshot_path, full_page=False)
+                            return {{
+                                "success": True,
+                                "screenshot_path": screenshot_path,
+                                "message": "{substep_plan['substep_description']} - already completed (attribute check)",
+                                "error": None
+                            }}
+                except:
+                    pass  # Verification not met, proceed with action
         
 '''
         
@@ -394,6 +467,32 @@ async def execute_substep_{substep_id}(page):
         except:
             # Element not found = not visible = good
             pass
+'''
+        
+        elif check_type == 'attribute_value':
+            verify_selector = verification.get('selector', target['primary_selector'])
+            attribute_name = verification.get('attribute', 'disabled')
+            expected_value = verification.get('expected', 'false')
+            script += f'''        
+        # Verify: attribute value (e.g., button enabled/disabled)
+        verify_selector = "{verify_selector}"
+        attribute_name = "{attribute_name}"
+        expected_value = "{expected_value}"
+        
+        await page.wait_for_selector(verify_selector, timeout=5000, state='visible')
+        element = page.locator(verify_selector)
+        
+        # For boolean attributes like 'disabled', check if attribute exists
+        if attribute_name == "disabled":
+            is_disabled = await element.is_disabled()
+            if expected_value.lower() in ["false", "no", "enabled"]:
+                assert not is_disabled, f"Element should be enabled but is disabled: {{verify_selector}}"
+            else:
+                assert is_disabled, f"Element should be disabled but is enabled: {{verify_selector}}"
+        else:
+            # For other attributes, get and compare value
+            actual_value = await element.get_attribute(attribute_name)
+            assert str(actual_value) == expected_value, f"Attribute '{{attribute_name}}' mismatch. Expected: {{expected_value}}, Got: {{actual_value}}"
 '''
         
         # Screenshot and return
@@ -539,6 +638,193 @@ Examples:
             # Fallback: assume not completed on error
             return {
                 "is_completed": False,
+                "confidence": 0.0,
+                "reason": f"Validation error: {str(e)}",
+                "evidence": "N/A"
+            }
+    
+    async def generate_login_action(
+        self,
+        login_info: Dict[str, Any],
+        page_context: Dict[str, Any],
+        login_state: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Generate next login action based on current page state
+        Supports multi-step login flows (Microsoft, Google, AWS, etc.)
+        
+        Returns:
+            {
+                "action_type": "enter_email" | "enter_password" | "click_next" | "click_submit" | "wait_for_redirect" | "completed" | "error",
+                "target": {"primary_selector": "...", "fallback_selectors": [...]},
+                "reason": "...",
+                "confidence": 0.0-1.0
+            }
+        """
+        
+        from .page_context import format_context_for_llm
+        context_text = format_context_for_llm(page_context)
+        
+        prompt = f"""You are an intelligent login automation agent. Analyze the current page and determine the next action to complete login.
+
+**Login Credentials:**
+- Email/Username: {login_info.get('email', 'N/A')}
+- Password: [REDACTED]
+
+**Current Login State:**
+- Email entered: {login_state.get('email_entered', False)}
+- Password entered: {login_state.get('password_entered', False)}
+- Current URL: {login_state.get('current_url', 'unknown')}
+- Attempt: {login_state.get('attempts', 1)}
+
+**Current Page Context:**
+{context_text}
+
+**Task:**
+Determine the NEXT ACTION to complete the login process. This could be:
+1. **enter_email** - If email/username field is visible and not yet filled
+2. **enter_password** - If password field is visible and not yet filled
+3. **click_next** - If there's a "Next" or "Continue" button (common in multi-step login like Microsoft)
+4. **click_submit** - If both credentials are entered and submit button is visible
+5. **wait_for_redirect** - If page is redirecting (OAuth/SSO flow)
+6. **completed** - If login appears successful (logged in page detected)
+7. **error** - If error message detected or stuck
+
+**Important:**
+- Support multi-step flows: email → next → password → submit
+- Detect OAuth/SSO redirects
+- Use actual selectors from the page context
+- Provide fallback selectors
+- Be smart about detecting success (URL changes, user menu visible, etc.)
+
+Return JSON:
+{{
+    "action_type": "enter_email|enter_password|click_next|click_submit|wait_for_redirect|completed|error",
+    "target": {{
+        "primary_selector": "CSS selector for target element",
+        "fallback_selectors": ["alternative selector 1", "alternative selector 2"]
+    }},
+    "reason": "Brief explanation of why this action",
+    "confidence": 0.0-1.0
+}}
+
+For wait_for_redirect/completed/error, target can be null.
+"""
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert at web automation and login flows. You understand multi-step authentication, OAuth, SSO, and various login patterns."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=0.3,
+                response_format={"type": "json_object"}
+            )
+            
+            result_text = response.choices[0].message.content
+            result = json.loads(result_text)
+            
+            return result
+            
+        except Exception as e:
+            print(f"Error in login action generation: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            return {
+                "action_type": "error",
+                "target": None,
+                "reason": f"LLM error: {str(e)}",
+                "confidence": 0.0
+            }
+    
+    async def validate_login_success(
+        self,
+        page_context: Dict[str, Any],
+        initial_url: str,
+        current_url: str
+    ) -> Dict[str, Any]:
+        """
+        Validate if login was successful by analyzing page state
+        
+        Returns:
+            {
+                "is_logged_in": bool,
+                "confidence": 0.0-1.0,
+                "reason": "...",
+                "evidence": "..."
+            }
+        """
+        
+        from .page_context import format_context_for_llm
+        context_text = format_context_for_llm(page_context)
+        
+        prompt = f"""You are validating if a login attempt was successful.
+
+**Initial URL:** {initial_url}
+**Current URL:** {current_url}
+
+**Current Page Context:**
+{context_text}
+
+**Task:**
+Determine if the user is now logged in successfully.
+
+**Success Indicators:**
+- URL changed from login page to dashboard/home/app page
+- Presence of user menu, profile icon, logout button
+- Absence of login form
+- Presence of navigation menus
+- Welcome message or user name displayed
+
+**Failure Indicators:**
+- Still on login page
+- Error messages visible
+- Login form still present
+- URL unchanged or redirected back to login
+
+Return JSON:
+{{
+    "is_logged_in": true/false,
+    "confidence": 0.0-1.0,
+    "reason": "Brief explanation",
+    "evidence": "Specific elements or URL patterns that indicate success/failure"
+}}
+"""
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert at detecting successful login states in web applications."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=0.2,
+                response_format={"type": "json_object"}
+            )
+            
+            result_text = response.choices[0].message.content
+            result = json.loads(result_text)
+            
+            return result
+            
+        except Exception as e:
+            print(f"Error in login validation: {e}")
+            return {
+                "is_logged_in": False,
                 "confidence": 0.0,
                 "reason": f"Validation error: {str(e)}",
                 "evidence": "N/A"

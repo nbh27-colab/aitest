@@ -11,6 +11,7 @@ import os
 from src.api.helper.db_session import get_db
 from src.services.autotest.workflow import AutoTestWorkflow
 from src.data.minIO.minIO_manager import PrivateS3
+from config.settings import MinIOSettings
 
 
 router = APIRouter(prefix="/autotest", tags=["autotest"])
@@ -58,8 +59,14 @@ async def run_autotest(
             )
         
         # Initialize MinIO client
-        # TODO: Get MinIO config from settings
-        minio_client = None  # PrivateS3(...)
+        minio_settings = MinIOSettings()
+        minio_client = PrivateS3(
+            private_url=minio_settings.MINIO_PRIVATE_URL,
+            public_url=minio_settings.MINIO_PUBLIC_URL,
+            region=minio_settings.MINIO_REGION,
+            user=minio_settings.MINIO_USER,
+            password=minio_settings.MINIO_PASSWORD
+        )
         
         # Create workflow
         workflow = AutoTestWorkflow(
