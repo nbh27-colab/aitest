@@ -30,3 +30,13 @@ class MinIOSettings(QABaseConfig):
     BUCKET_NAME: str
     FOLDER_NAME: str
     LOGIN_SCREENSHOT_FOLDER: str
+
+class LLMSettings(QABaseConfig):
+    OPENAI_API_KEY: str
+
+    # Model parameters
+    TEMPERATURE: float = 0.0
+    TOP_P: float = 1.0
+    MAX_TOKENS: int = 4096
+    TIME_OUT: int = 60
+    BASE_DELAY: float = 2.0
