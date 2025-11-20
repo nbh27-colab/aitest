@@ -11,7 +11,7 @@ import os
 from src.api.helper.db_session import get_db
 from src.services.autotest.workflow import AutoTestWorkflow
 from src.data.minIO.minIO_manager import PrivateS3
-from config.settings import MinIOSettings
+from config.settings import MinIOSettings, LLMSettings
 
 
 router = APIRouter(prefix="/autotest", tags=["autotest"])
@@ -21,7 +21,6 @@ class AutoTestRequest(BaseModel):
     """Request body for autotest"""
     test_case_id: int
     login_info_id: int
-    openai_api_key: Optional[str] = None  # Optional, sẽ dùng env var nếu không có
 
 
 class AutoTestResponse(BaseModel):
@@ -50,14 +49,6 @@ async def run_autotest(
         Result của autotest execution
     """
     try:
-        # Get OpenAI API key
-        api_key = request.openai_api_key or os.getenv('OPENAI_API_KEY')
-        if not api_key:
-            raise HTTPException(
-                status_code=400,
-                detail="OpenAI API key not provided and not found in environment"
-            )
-        
         # Initialize MinIO client
         minio_settings = MinIOSettings()
         minio_client = PrivateS3(
@@ -68,11 +59,14 @@ async def run_autotest(
             password=minio_settings.MINIO_PASSWORD
         )
         
+        # Initialize LLMSettings
+        llm_settings = LLMSettings()
+
         # Create workflow
         workflow = AutoTestWorkflow(
             db_session=db,
             minio_client=minio_client,
-            openai_api_key=api_key
+            llm_settings=llm_settings,
         )
         
         # Run workflow

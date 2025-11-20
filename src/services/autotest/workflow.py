@@ -6,6 +6,7 @@ Sequential execution với context awareness
 from typing import Dict, Any, Literal
 from langgraph.graph import StateGraph, END
 from sqlalchemy.orm import Session
+from config.settings import LLMSettings
 
 from .state import AutoTestState
 from .nodes import AutoTestNodes
@@ -17,9 +18,9 @@ class AutoTestWorkflow:
     Sequential execution với context awareness
     """
     
-    def __init__(self, db_session: Session, minio_client, openai_api_key: str):
+    def __init__(self, db_session: Session, minio_client, llm_settings: LLMSettings):
         self.db_session = db_session
-        self.nodes = AutoTestNodes(db_session, minio_client, openai_api_key)
+        self.nodes = AutoTestNodes(db_session, minio_client, llm_settings.OPENAI_API_KEY)
         self.graph = self._build_graph()
     
     def _move_to_next_step(self, state: AutoTestState) -> AutoTestState:
@@ -43,6 +44,7 @@ class AutoTestWorkflow:
         state['consecutive_failures'] = 0
         state['current_substep_id'] = None  # CRITICAL: Reset substep ID
         
+    
         # Skip any already completed steps
         while (state['current_step_index'] < len(state['steps']) and 
                state['current_step_index'] in state['completed_steps']):
