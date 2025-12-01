@@ -8,7 +8,7 @@ from langgraph.graph import StateGraph, END
 from sqlalchemy.orm import Session
 from config.settings import LLMSettings
 
-from .state import AutoTestState
+from .states import AutoTestState
 from .nodes import AutoTestNodes
 
 
@@ -20,7 +20,7 @@ class AutoTestWorkflow:
     
     def __init__(self, db_session: Session, minio_client, llm_settings: LLMSettings):
         self.db_session = db_session
-        self.nodes = AutoTestNodes(db_session, minio_client, llm_settings.OPENAI_API_KEY)
+        self.nodes = AutoTestNodes(db_session, minio_client, llm_settings)
         self.graph = self._build_graph()
     
     def _move_to_next_step(self, state: AutoTestState) -> AutoTestState:
